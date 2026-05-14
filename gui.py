@@ -1,0 +1,403 @@
+"""Tkinter GUI 界面模块"""
+
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+from extractor import process_pdf
+from processor import group_and_sort, process_and_output
+
+
+class RemarksDialog:
+    """中文备注编辑弹窗"""
+
+    def __init__(self, parent, sku_counts, existing_remarks=None):
+        self.result = None
+        self.remarks = dict(existing_remarks) if existing_remarks else {}
+        self.entries = {}
+        self.sku_counts = sku_counts  # {sku: page_count}
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("编辑中文备注")
+        self.dialog.geometry("520x460")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        self._build_ui(list(sku_counts.keys()))
+        self.dialog.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - 520) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - 460) // 2
+        self.dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _build_ui(self, skus):
+        header = ttk.Frame(self.dialog, padding=10)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="为每个 SKU 输入中文备注（留空则使用原 SKU）：",
+                  font=("", 10)).pack(anchor=tk.W)
+
+        container = ttk.Frame(self.dialog)
+        container.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        canvas = tk.Canvas(container)
+        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable = ttk.Frame(canvas)
+
+        scrollable.bind("<Configure>",
+                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        for i, sku in enumerate(sorted(skus)):
+            row = ttk.Frame(scrollable)
+            row.pack(fill=tk.X, pady=3)
+
+            count = self.sku_counts.get(sku, 1)
+            label_text = f"{sku} ({count}页)"
+            ttk.Label(row, text=label_text, width=26, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 8))
+            entry = ttk.Entry(row, width=28)
+            entry.pack(side=tk.LEFT)
+            if sku in self.remarks:
+                entry.insert(0, self.remarks[sku])
+            self.entries[sku] = entry
+
+        btn_frame = ttk.Frame(self.dialog, padding=10)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="确定", command=self._on_ok, width=10).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy, width=10).pack(side=tk.RIGHT)
+
+    def _on_ok(self):
+        self.result = {}
+        for sku, entry in self.entries.items():
+            val = entry.get().strip()
+            if val:
+                self.result[sku] = val
+        self.dialog.destroy()
+
+
+class LogWindow:
+    """日志输出窗口"""
+
+    def __init__(self, parent):
+        self.window = tk.Toplevel(parent)
+        self.window.title("处理日志")
+        self.window.geometry("600x300")
+        self.window.withdraw()
+
+        self.text = scrolledtext.ScrolledText(self.window, wrap=tk.WORD, state=tk.DISABLED)
+        self.text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def show(self):
+        self.window.deiconify()
+        self.window.lift()
+
+    def log(self, message):
+        self.text.configure(state=tk.NORMAL)
+        self.text.insert(tk.END, message + "\n")
+        self.text.see(tk.END)
+        self.text.configure(state=tk.DISABLED)
+
+    def clear(self):
+        self.text.configure(state=tk.NORMAL)
+        self.text.delete("1.0", tk.END)
+        self.text.configure(state=tk.DISABLED)
+
+
+class App:
+    """主应用窗口"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("亚马逊外箱标签智能分组系统")
+        self.root.geometry("920x620")
+        self.root.minsize(800, 500)
+
+        self.pdf_files = []
+        self.extracted_data = []
+        self.exceptions = []
+        self.remarks = {}
+        self.output_dir = ""
+
+        self._build_ui()
+
+    def _build_ui(self):
+        # 顶部按钮栏
+        top = ttk.Frame(self.root, padding=10)
+        top.pack(fill=tk.X)
+
+        ttk.Button(top, text="导入 PDF", command=self._import_pdfs).pack(side=tk.LEFT, padx=3)
+        ttk.Button(top, text="编辑中文备注", command=self._edit_remarks).pack(side=tk.LEFT, padx=3)
+        ttk.Button(top, text="处理并输出", command=self._process_output).pack(side=tk.LEFT, padx=3)
+        ttk.Button(top, text="查看日志", command=self._show_log).pack(side=tk.LEFT, padx=3)
+        ttk.Button(top, text="清空重置", command=self._reset).pack(side=tk.RIGHT, padx=3)
+
+        # 中间区域 - 左右分栏
+        middle = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        middle.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 左侧：文件列表
+        left = ttk.LabelFrame(middle, text="已导入的 PDF 文件", padding=5)
+        middle.add(left, weight=1)
+
+        self.file_listbox = tk.Listbox(left, font=("", 9))
+        file_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.file_listbox.yview)
+        self.file_listbox.configure(yscrollcommand=file_scroll.set)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        file_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 右侧：提取结果表格
+        right = ttk.LabelFrame(middle, text="提取结果", padding=5)
+        middle.add(right, weight=3)
+
+        columns = ("sku", "remark", "destination", "box", "status")
+        self.tree = ttk.Treeview(right, columns=columns, show="headings", height=15)
+
+        self.tree.heading("sku", text="SKU / FNSKU")
+        self.tree.heading("remark", text="中文备注")
+        self.tree.heading("destination", text="目的地仓库")
+        self.tree.heading("box", text="箱号")
+        self.tree.heading("status", text="状态")
+
+        self.tree.column("sku", width=160, minwidth=100)
+        self.tree.column("remark", width=120, minwidth=80)
+        self.tree.column("destination", width=100, minwidth=60)
+        self.tree.column("box", width=80, minwidth=50)
+        self.tree.column("status", width=80, minwidth=50)
+
+        tree_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 底部状态栏
+        bottom = ttk.Frame(self.root, padding=(10, 5))
+        bottom.pack(fill=tk.X)
+
+        self.progress = ttk.Progressbar(bottom, mode="determinate")
+        self.progress.pack(fill=tk.X, pady=(0, 5))
+
+        self.status_var = tk.StringVar(value="就绪 — 请导入亚马逊外箱标签 PDF 文件")
+        ttk.Label(bottom, textvariable=self.status_var, font=("", 9)).pack(anchor=tk.W)
+
+        # 日志窗口
+        self.log_window = LogWindow(self.root)
+
+    def _set_status(self, text):
+        self.status_var.set(text)
+        self.root.update_idletasks()
+
+    def _import_pdfs(self):
+        files = filedialog.askopenfilenames(
+            title="选择亚马逊外箱标签 PDF（可多次导入）",
+            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")]
+        )
+        if not files:
+            return
+
+        # 增量导入，跳过已存在的文件
+        existing = set(self.pdf_files)
+        new_files = [f for f in files if f not in existing]
+        if not new_files:
+            messagebox.showinfo("提示", "所选文件已全部导入。")
+            return
+
+        self.pdf_files.extend(new_files)
+        for f in new_files:
+            self.file_listbox.insert(tk.END, os.path.basename(f))
+
+        self._set_status(f"已导入 {len(self.pdf_files)} 个 PDF（新增 {len(new_files)} 个），正在提取数据...")
+        self.log_window.log(f"新增 {len(new_files)} 个 PDF，共 {len(self.pdf_files)} 个")
+
+        threading.Thread(target=self._extract_all, daemon=True).start()
+
+    def _extract_all(self):
+        """后台线程提取所有 PDF 数据"""
+        self.extracted_data = []
+        self.exceptions = []
+
+        for i, fpath in enumerate(self.pdf_files):
+            self._set_status(f"正在处理 ({i + 1}/{len(self.pdf_files)})：{os.path.basename(fpath)}")
+            self.log_window.log(f"处理：{os.path.basename(fpath)}")
+
+            try:
+                results, excs = process_pdf(fpath)
+                self.extracted_data.extend(results)
+                self.exceptions.extend(excs)
+
+                ok = len(results)
+                fail = len(excs)
+                self.log_window.log(f"  成功提取 {ok} 页，异常 {fail} 页")
+            except Exception as e:
+                self.log_window.log(f"  错误：{e}")
+
+        self.root.after(0, self._on_extract_done)
+
+    def _on_extract_done(self):
+        self._refresh_tree()
+
+        skus = set(p['sku'] for p in self.extracted_data if p.get('sku'))
+        n_pages = len(self.extracted_data) + len(self.exceptions)
+
+        self._set_status(
+            f"提取完成：共 {n_pages} 页，识别 {len(skus)} 个 SKU，"
+            f"{len(self.exceptions)} 页异常"
+        )
+        self.log_window.log(
+            f"提取完成：{len(skus)} 个 SKU，{len(self.exceptions)} 页异常"
+        )
+        self.progress['value'] = 100
+
+        if self.exceptions:
+            messagebox.showwarning(
+                "提取完成",
+                f"共 {n_pages} 页：{len(self.extracted_data)} 页成功，"
+                f"{len(self.exceptions)} 页无法识别。\n"
+                f"无法识别的页面将归入「异常_需人工核对.pdf」。"
+            )
+
+    def _refresh_tree(self):
+        """刷新结果表格 - 按 SKU 去重合并展示"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        # 按 SKU 汇总（去重合并，忽略大小写）
+        sku_info = {}       # key: 标准化key → value: {display, count, destinations, boxes}
+        for p in self.extracted_data:
+            raw_sku = (p.get('sku') or '').strip()
+            if not raw_sku:
+                continue
+            key = raw_sku.upper()  # 忽略大小写合并
+            if key not in sku_info:
+                sku_info[key] = {
+                    'display': raw_sku,
+                    'count': 0,
+                    'destinations': set(),
+                }
+            sku_info[key]['count'] += 1
+            if p.get('destination'):
+                sku_info[key]['destinations'].add(p['destination'])
+
+        for key in sorted(sku_info.keys()):
+            info = sku_info[key]
+            sku = info['display']
+            remark = self.remarks.get(sku, "")
+            dests = ", ".join(sorted(info['destinations'])) if info['destinations'] else "-"
+
+            # 箱号：系统自动从1编号，显示总箱数
+            box_str = f"共{info['count']}箱"
+
+            self.tree.insert("", tk.END, values=(
+                sku, remark, dests, box_str, "正常"
+            ))
+
+        for p in self.exceptions:
+            sku = p.get('sku') or "无法识别"
+            err = p.get('error', '字段提取失败')
+            self.tree.insert("", tk.END, values=(
+                sku, "", p.get('destination', '-'),
+                "-", f"异常: {err[:20]}"
+            ))
+
+    def _edit_remarks(self):
+        if not self.extracted_data:
+            messagebox.showinfo("提示", "请先导入并提取 PDF 数据。")
+            return
+
+        # 统计每个 SKU 的页数
+        sku_counts = {}
+        for p in self.extracted_data:
+            sku = p.get('sku')
+            if sku:
+                sku_counts[sku] = sku_counts.get(sku, 0) + 1
+
+        if not sku_counts:
+            messagebox.showinfo("提示", "未识别到任何 SKU，请检查 PDF 文件。")
+            return
+
+        dialog = RemarksDialog(self.root, sku_counts, self.remarks)
+        self.root.wait_window(dialog.dialog)
+
+        if dialog.result is not None:
+            self.remarks = dialog.result
+            self._refresh_tree()
+            self.log_window.log(f"已更新 {len(self.remarks)} 个 SKU 的中文备注")
+
+    def _process_output(self):
+        if not self.extracted_data:
+            messagebox.showinfo("提示", "请先导入并提取 PDF 数据。")
+            return
+
+        self.output_dir = filedialog.askdirectory(title="选择输出文件夹")
+        if not self.output_dir:
+            return
+
+        self._set_status("正在处理并生成输出 PDF...")
+        self.log_window.log(f"开始处理，输出目录：{self.output_dir}")
+
+        total = len(self.extracted_data) + len(self.exceptions)
+        self.progress['maximum'] = max(total, 1)
+        self.progress['value'] = 0
+
+        def progress_cb(val):
+            self.root.after(0, lambda: setattr(self.progress, 'value', val))
+
+        def do_process():
+            try:
+                n_pages, n_exc = process_and_output(
+                    self.extracted_data, self.exceptions,
+                    self.remarks, self.output_dir,
+                    progress_callback=progress_cb
+                )
+                self.root.after(0, lambda: self._on_process_done(n_pages, n_exc))
+            except Exception as e:
+                self.log_window.log(f"处理出错：{e}")
+                self.root.after(0, lambda: messagebox.showerror("错误", str(e)))
+
+        threading.Thread(target=do_process, daemon=True).start()
+
+    def _on_process_done(self, n_pages, n_exc):
+        skus = set(p['sku'] for p in self.extracted_data if p.get('sku'))
+        grouped = group_and_sort(self.extracted_data, self.remarks)
+
+        self._set_status(
+            f"输出完成：生成 {len(grouped)} 个 SKU PDF"
+            + (f"，{n_exc} 页异常文件" if n_exc else "")
+        )
+        self.log_window.log(
+            f"输出完成：{len(grouped)} 个分组文件"
+            + (f"，{n_exc} 页异常" if n_exc else "")
+        )
+
+        msg = f"已生成 {len(grouped)} 个分组 PDF 文件到：\n{self.output_dir}"
+        if n_exc:
+            msg += f"\n\n另有 {n_exc} 页异常页面归入「异常_需人工核对.pdf」"
+        messagebox.showinfo("处理完成", msg)
+
+    def _show_log(self):
+        self.log_window.show()
+
+    def _reset(self):
+        if not messagebox.askyesno("确认", "确定要清空所有数据并重新开始吗？"):
+            return
+
+        self.pdf_files = []
+        self.extracted_data = []
+        self.exceptions = []
+        self.remarks = {}
+        self.output_dir = ""
+
+        self.file_listbox.delete(0, tk.END)
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.progress['value'] = 0
+        self._set_status("已重置 — 请导入亚马逊外箱标签 PDF 文件")
+        self.log_window.clear()
+        self.log_window.log("已重置")

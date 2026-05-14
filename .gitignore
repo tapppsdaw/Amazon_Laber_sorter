@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+test_*.pdf
+屏幕截图*.png
