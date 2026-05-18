@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from extractor import process_pdf
-from processor import group_and_sort, process_and_output
+from processor import group_and_sort, match_forwarder_to_amazon, process_and_output
 
 
 class RemarksDialog:
@@ -156,18 +156,20 @@ class App:
         right = ttk.LabelFrame(middle, text="提取结果", padding=5)
         middle.add(right, weight=3)
 
-        columns = ("sku", "remark", "destination", "box", "status")
+        columns = ("type", "sku", "remark", "destination", "box", "status")
         self.tree = ttk.Treeview(right, columns=columns, show="headings", height=15)
 
+        self.tree.heading("type", text="类型")
         self.tree.heading("sku", text="SKU / FNSKU")
         self.tree.heading("remark", text="中文备注")
         self.tree.heading("destination", text="目的地仓库")
-        self.tree.heading("box", text="箱号")
+        self.tree.heading("box", text="箱号/序号")
         self.tree.heading("status", text="状态")
 
-        self.tree.column("sku", width=160, minwidth=100)
-        self.tree.column("remark", width=120, minwidth=80)
-        self.tree.column("destination", width=100, minwidth=60)
+        self.tree.column("type", width=50, minwidth=40)
+        self.tree.column("sku", width=140, minwidth=90)
+        self.tree.column("remark", width=100, minwidth=70)
+        self.tree.column("destination", width=90, minwidth=55)
         self.tree.column("box", width=80, minwidth=50)
         self.tree.column("status", width=80, minwidth=50)
 
@@ -222,9 +224,25 @@ class App:
         self.extracted_data = []
         self.exceptions = []
 
+        # 先统计总页数
+        import fitz
+        total_pages = 0
+        for fpath in self.pdf_files:
+            try:
+                doc = fitz.open(fpath)
+                total_pages += len(doc)
+                doc.close()
+            except:
+                pass
+
+        self.root.after(0, lambda: setattr(self.progress, 'maximum', max(total_pages, 1)))
+        self.root.after(0, lambda: setattr(self.progress, 'value', 0))
+
+        processed_pages = 0
         for i, fpath in enumerate(self.pdf_files):
-            self._set_status(f"正在处理 ({i + 1}/{len(self.pdf_files)})：{os.path.basename(fpath)}")
-            self.log_window.log(f"处理：{os.path.basename(fpath)}")
+            fname = os.path.basename(fpath)
+            self._set_status(f"正在处理 ({i + 1}/{len(self.pdf_files)})：{fname}")
+            self.log_window.log(f"处理：{fname}")
 
             try:
                 results, excs = process_pdf(fpath)
@@ -233,6 +251,8 @@ class App:
 
                 ok = len(results)
                 fail = len(excs)
+                processed_pages += ok + fail
+                self.root.after(0, lambda v=processed_pages: setattr(self.progress, 'value', v))
                 self.log_window.log(f"  成功提取 {ok} 页，异常 {fail} 页")
             except Exception as e:
                 self.log_window.log(f"  错误：{e}")
@@ -240,18 +260,26 @@ class App:
         self.root.after(0, self._on_extract_done)
 
     def _on_extract_done(self):
+        # 提取完成后立即匹配货代标签
+        has_forwarder = any(p.get('label_type') == 'forwarder' for p in self.extracted_data)
+        if has_forwarder:
+            match_forwarder_to_amazon(self.extracted_data, self.remarks)
+
         self._refresh_tree()
 
-        skus = set(p['sku'] for p in self.extracted_data if p.get('sku'))
+        fba_pages = [p for p in self.extracted_data if p.get('label_type', 'amazon') != 'forwarder']
+        fwd_pages = [p for p in self.extracted_data if p.get('label_type') == 'forwarder']
+        skus = set(p['sku'] for p in fba_pages if p.get('sku'))
         n_pages = len(self.extracted_data) + len(self.exceptions)
 
-        self._set_status(
-            f"提取完成：共 {n_pages} 页，识别 {len(skus)} 个 SKU，"
-            f"{len(self.exceptions)} 页异常"
-        )
-        self.log_window.log(
-            f"提取完成：{len(skus)} 个 SKU，{len(self.exceptions)} 页异常"
-        )
+        status = f"提取完成：共 {n_pages} 页，FBA {len(fba_pages)} 页（{len(skus)} 个 SKU）"
+        if fwd_pages:
+            matched = len([p for p in fwd_pages if p.get('matched_fba')])
+            status += f"，货代 {len(fwd_pages)} 页（{matched} 个已匹配）"
+        if self.exceptions:
+            status += f"，异常 {len(self.exceptions)} 页"
+        self._set_status(status)
+        self.log_window.log(status)
         self.progress['value'] = 100
 
         if self.exceptions:
@@ -263,45 +291,68 @@ class App:
             )
 
     def _refresh_tree(self):
-        """刷新结果表格 - 按 SKU 去重合并展示"""
+        """刷新结果表格 - 按类型和 SKU 去重合并展示"""
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # 按 SKU 汇总（去重合并，忽略大小写）
-        sku_info = {}       # key: 标准化key → value: {display, count, destinations, boxes}
+        # FBA 标签汇总
+        fba_info = {}
+        fwd_count = 0
         for p in self.extracted_data:
+            if p.get('label_type') == 'forwarder':
+                fwd_count += 1
+                continue
             raw_sku = (p.get('sku') or '').strip()
             if not raw_sku:
                 continue
-            key = raw_sku.upper()  # 忽略大小写合并
-            if key not in sku_info:
-                sku_info[key] = {
+            key = raw_sku.upper()
+            if key not in fba_info:
+                fba_info[key] = {
                     'display': raw_sku,
                     'count': 0,
                     'destinations': set(),
                 }
-            sku_info[key]['count'] += 1
+            fba_info[key]['count'] += 1
             if p.get('destination'):
-                sku_info[key]['destinations'].add(p['destination'])
+                fba_info[key]['destinations'].add(p['destination'])
 
-        for key in sorted(sku_info.keys()):
-            info = sku_info[key]
+        for key in sorted(fba_info.keys()):
+            info = fba_info[key]
             sku = info['display']
             remark = self.remarks.get(sku, "")
             dests = ", ".join(sorted(info['destinations'])) if info['destinations'] else "-"
-
-            # 箱号：系统自动从1编号，显示总箱数
             box_str = f"共{info['count']}箱"
-
             self.tree.insert("", tk.END, values=(
-                sku, remark, dests, box_str, "正常"
+                "FBA", sku, remark, dests, box_str, "正常"
             ))
 
+        # 货代标签（显示匹配到的 FBA 信息）
+        for p in self.extracted_data:
+            if p.get('label_type') != 'forwarder':
+                continue
+            fba = p.get('matched_fba')
+            # 显示对应的 FBA SKU，而不是 OCR 读到的乱码
+            if fba:
+                sku = fba.get('sku') or "-"
+            else:
+                sku = p.get('sku') or "-"
+            dest = p.get('destination') or "-"
+            seq = p.get('seq_num')
+            seq_total = p.get('seq_total')
+            box_str = f"序号 {seq}/{seq_total}" if seq else "-"
+            remark = p.get('remark', '')
+            status = "已匹配" if fba else "待匹配"
+            self.tree.insert("", tk.END, values=(
+                "货代", sku, remark, dest, box_str, status
+            ))
+
+        # 异常页面
         for p in self.exceptions:
             sku = p.get('sku') or "无法识别"
             err = p.get('error', '字段提取失败')
+            label_type = "货代" if p.get('label_type') == 'forwarder' else "FBA"
             self.tree.insert("", tk.END, values=(
-                sku, "", p.get('destination', '-'),
+                label_type, sku, "", p.get('destination', '-'),
                 "-", f"异常: {err[:20]}"
             ))
 
@@ -326,6 +377,10 @@ class App:
 
         if dialog.result is not None:
             self.remarks = dialog.result
+            # 重新匹配货代标签以更新备注
+            has_forwarder = any(p.get('label_type') == 'forwarder' for p in self.extracted_data)
+            if has_forwarder:
+                match_forwarder_to_amazon(self.extracted_data, self.remarks)
             self._refresh_tree()
             self.log_window.log(f"已更新 {len(self.remarks)} 个 SKU 的中文备注")
 
