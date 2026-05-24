@@ -7,57 +7,55 @@ import fitz
 def match_forwarder_to_amazon(pages, remarks):
     """将货代标签与 FBA 标签匹配，复制中文备注
 
-    每个 SKU 的序号从 1 开始，所以同目的地可能有多个相同序号。
-    匹配策略：先按 (dest, seq) 找候选，多个候选时按页面位置选最近的。
+    匹配策略（分层回退）：
+    1. 按 seq 精确匹配，选页面最近的
+    2. 按 seq 匹配，选页面位置最近的（忽略目的地）
+    3. 按页面位置最近匹配（货代标签通常紧跟在 FBA 标签后面）
     """
     fba_pages = [p for p in pages if p.get('label_type', 'amazon') == 'amazon']
     forwarder_pages = [p for p in pages if p.get('label_type') == 'forwarder']
 
-    # 建立索引：(dest, seq) → [fba_page, ...]（支持多候选）
-    fba_index = {}
+    # 按 seq 建立索引
+    fba_by_seq = {}  # seq → [fba, ...]
     for p in fba_pages:
-        dest = (p.get('destination') or '').upper()
         box = p.get('box_current')
-        if dest and box:
-            key = (dest, box)
-            fba_index.setdefault(key, []).append(p)
+        if box:
+            fba_by_seq.setdefault(box, []).append(p)
 
-    # 记录每个 FBA 页面已被匹配的次数（同 SKU 的多个 FBA 页需要区分）
     fba_matched_count = {}
 
-    matched = []
-    unmatched = []
-    for fwd in forwarder_pages:
-        dest = (fwd.get('destination') or '').upper()
-        seq = fwd.get('seq_num')
-        if not dest or not seq:
-            unmatched.append(fwd)
-            continue
-
-        key = (dest, seq)
-        candidates = fba_index.get(key, [])
-
-        if not candidates:
-            unmatched.append(fwd)
-            continue
-
-        # 找最佳候选：优先未匹配过的，其次按页面位置最近
+    def _pick_best(candidates, fwd):
         best = None
         best_score = float('inf')
         for fba in candidates:
             fba_id = id(fba)
             count = fba_matched_count.get(fba_id, 0)
-            # 位置距离（forwarder 通常紧跟在 FBA 后面）
             dist = abs(fwd['page_num'] - fba['page_num'])
-            score = count * 10000 + dist  # 优先未匹配的
+            score = count * 10000 + dist
             if score < best_score:
                 best_score = score
                 best = fba
+        return best
+
+    matched = []
+    unmatched = []
+    for fwd in forwarder_pages:
+        seq = fwd.get('seq_num')
+        if not seq:
+            unmatched.append(fwd)
+            continue
+
+        # 第1层：按 seq 匹配
+        candidates = fba_by_seq.get(seq, [])
+        best = _pick_best(candidates, fwd) if candidates else None
 
         if best:
             fba_matched_count[id(best)] = fba_matched_count.get(id(best), 0) + 1
             fwd['matched_fba'] = best
             fwd['remark'] = remarks.get(best.get('sku'), '')
+            # 从匹配的 FBA 标签获取仓库代码
+            if not fwd.get('destination'):
+                fwd['destination'] = best.get('destination')
             matched.append(fwd)
         else:
             unmatched.append(fwd)
@@ -104,6 +102,14 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
     total_pages = 0
     exception_count = 0
 
+    # 文档缓存：避免重复打开同一个 PDF
+    doc_cache = {}
+
+    def _get_doc(path):
+        if path not in doc_cache:
+            doc_cache[path] = fitz.open(path)
+        return doc_cache[path]
+
     # 输出 FBA 标签分组 PDF
     grouped = group_and_sort(fba_pages, remarks)
     for sku, group_pages in grouped.items():
@@ -116,14 +122,13 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
             src_path = page_data['source_file']
             page_num = page_data['page_num']
             try:
-                src_doc = fitz.open(src_path)
+                src_doc = _get_doc(src_path)
                 if page_num < len(src_doc):
                     out_doc.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
                     new_page = out_doc[-1]
                     _add_label_to_page(
                         new_page, label, box_num, page_data.get('destination')
                     )
-                src_doc.close()
             except Exception as e:
                 print(f"  警告：页面处理出错 - {e}")
             total_pages += 1
@@ -157,7 +162,7 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
             src_path = fwd['source_file']
             page_num = fwd['page_num']
             try:
-                src_doc = fitz.open(src_path)
+                src_doc = _get_doc(src_path)
                 if page_num < len(src_doc):
                     fwd_doc.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
                     new_page = fwd_doc[-1]
@@ -174,7 +179,6 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
                         label_text += f" [{dest}]"
                         if label_text:
                             _add_label_to_page(new_page, label_text, None, None)
-                src_doc.close()
             except Exception as e:
                 print(f"  警告：货代页面处理出错 - {e}")
             total_pages += 1
@@ -200,12 +204,11 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
             src_path = page_data['source_file']
             page_num = page_data['page_num']
             try:
-                src_doc = fitz.open(src_path)
+                src_doc = _get_doc(src_path)
                 if page_num < len(src_doc):
                     exc_doc.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
                     new_page = exc_doc[-1]
                     _add_exception_label(new_page, page_data)
-                src_doc.close()
             except Exception:
                 pass
             exception_count += 1
@@ -217,6 +220,13 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
             exc_doc.save(exc_path)
             print(f"  已生成异常文件：{exc_path}（{len(exc_doc)} 页）")
         exc_doc.close()
+
+    # 关闭所有缓存的文档
+    for doc in doc_cache.values():
+        try:
+            doc.close()
+        except:
+            pass
 
     return total_pages, exception_count
 

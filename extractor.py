@@ -11,7 +11,12 @@ def _get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
         import easyocr
-        _ocr_reader = easyocr.Reader(['en', 'ch_sim'], gpu=False, verbose=False)
+        try:
+            import torch
+            use_gpu = torch.cuda.is_available()
+        except Exception:
+            use_gpu = False
+        _ocr_reader = easyocr.Reader(['en', 'ch_sim'], gpu=use_gpu, verbose=False)
     return _ocr_reader
 
 
@@ -24,17 +29,18 @@ def extract_page_text(page):
 def ocr_page(page):
     """用 EasyOCR 识别页面图片中的文字，返回合并后的文本
 
-    优化：渲染时裁剪页面下半部分（序号在 ~73% 高度处），减少 OCR 面积以提速约 50%
+    优化：
+    - 裁剪底部 40%（序号和仓库代码在页面下半部分）
+    - DPI 200（平衡速度和识别率）
+    - detail=0 跳过 bounding box 计算
     """
     reader = _get_ocr_reader()
     rect = page.rect
-    # 裁剪下半部分（从 40% 到底部），保留序号、仓库代码等关键信息
-    clip = fitz.Rect(rect.x0, rect.y0 + rect.height * 0.4, rect.x1, rect.y1)
-    pix = page.get_pixmap(dpi=300, clip=clip)
+    clip = fitz.Rect(rect.x0, rect.y0 + rect.height * 0.6, rect.x1, rect.y1)
+    pix = page.get_pixmap(dpi=200, clip=clip)
     img_bytes = pix.tobytes("png")
-    results = reader.readtext(img_bytes)
-    lines = [text for _, text, _ in results]
-    return "\n".join(lines)
+    results = reader.readtext(img_bytes, detail=0)
+    return "\n".join(results)
 
 
 def detect_label_type(text):
@@ -133,8 +139,9 @@ def extract_destination_fc(text):
     )
     if m:
         return m.group(1).upper()
-    # 兜底：找 3-4 字母 + 1-2 数字的模式（如 LAX9, TEB9, ONT8）
-    m = re.search(r'\b([A-Z]{3,4}\d{1,2})\b', text)
+    # 兜底：找 3-4 字母 + 1-2 数字的模式（如 LAX9, TEB9, ONT8, CLT2）
+    # 使用 (?=[^A-Z0-9]) 而非 \b 来处理下划线等字符
+    m = re.search(r'(?<![A-Z0-9])([A-Z]{3,4}\d{1,2})(?=[^A-Z0-9]|$)', text)
     if m:
         return m.group(1)
     return None
@@ -204,20 +211,34 @@ def extract_forwarder_info(ocr_text, page_num, doc_path):
         seq_num = int(m.group(1))
         seq_total = int(m.group(2))
 
-    # 提取仓库代码（如 LAX9, TEB9）— OCR 可能把 9 读成 g/o/q
+    # 提取仓库代码（如 LAX9, TEB9, SBD1）— OCR 可能把字母读成数字
     upper_text = ocr_text.upper()
+    # 清理干扰文本：移除括号内容（通常是电话号码）和带点号的数字
+    clean_text = re.sub(r'\([^)]*\)', ' ', upper_text)
+    clean_text = re.sub(r'\b\d+\.\d+\b', ' ', clean_text)
     # 先用标准模式
-    destination = extract_destination_fc(upper_text)
+    destination = extract_destination_fc(clean_text)
     if not destination:
-        # 宽松匹配：3-4 字母 + 1-2 字符（数字或 OCR 误读的字母）
-        m = re.search(r'\b([A-Z]{3,4}[0-9GOQ]{1,2})\b', upper_text)
+        # 宽松匹配：任何 4-5 字符组合，尝试修正 OCR 错误
+        m = re.search(r'\b([A-Z0-9]{4,5})\b', clean_text)
         if m:
             raw = m.group(1)
-            # 修正常见 OCR 错误
-            fixed = raw.replace('O', '0').replace('G', '9').replace('Q', '0')
-            # 只保留合理的仓库代码（字母+数字）
-            if re.match(r'^[A-Z]{3,4}\d{1,2}$', fixed):
-                destination = fixed
+            # 对前 3 位：数字→字母（8→B, 0→O, 1→I）
+            prefix = raw[:3]
+            prefix_fixed = prefix.replace('8', 'B').replace('0', 'O').replace('1', 'I')
+            # 对后 1-2 位：保持原样（可能是数字也可能是 OCR 误读的字母）
+            suffix = raw[3:]
+            # 合并后尝试两种修正：
+            # 方案 A：后缀保持原样
+            candidate_a = prefix_fixed + suffix
+            # 方案 B：后缀也做字母→数字修正（O→0, G→9, Q→0）
+            suffix_fixed = suffix.replace('O', '0').replace('G', '9').replace('Q', '0')
+            candidate_b = prefix_fixed + suffix_fixed
+            for candidate in [candidate_a, candidate_b]:
+                # 验证：必须是 3-4 个字母 + 1-2 个数字，且不能以数字开头
+                if re.match(r'^[A-Z]{3,4}\d{1,2}$', candidate) and candidate[0].isalpha():
+                    destination = candidate
+                    break
 
     # 提取 SKU 标识
     sku = None
@@ -269,7 +290,7 @@ def extract_page_info(page, page_num, doc_path):
     return info, False
 
 
-def process_pdf(file_path):
+def process_pdf(file_path, page_callback=None):
     """处理单个 PDF 文件，返回 (成功页面列表, 异常页面列表)"""
     results = []
     exceptions = []
@@ -279,36 +300,49 @@ def process_pdf(file_path):
     except Exception as e:
         return [], [{'page_num': 0, 'error': str(e), 'source_file': file_path}]
 
-    for page_num in range(len(doc)):
+    total = len(doc)
+    for page_num in range(total):
         page = doc[page_num]
-        text = extract_page_text(page)
-        label_type = detect_label_type(text)
 
-        if label_type == 'forwarder':
-            # 货代标签：文字层为空，用 OCR 提取
-            try:
-                ocr_text = ocr_page(page)
-                info = extract_forwarder_info(ocr_text, page_num, file_path)
-                # 只要有序号就算成功
-                if info.get('seq_num') is not None:
-                    results.append(info)
-                else:
-                    info['error'] = '序号提取失败'
-                    exceptions.append(info)
-            except Exception as e:
-                exceptions.append({
-                    'page_num': page_num,
-                    'error': f'OCR失败: {e}',
-                    'source_file': file_path,
-                    'label_type': 'forwarder',
-                })
-        else:
-            # FBA 标签：用文字层提取
+        if page_callback:
+            page_callback(page_num + 1, total)
+
+        text = extract_page_text(page)
+
+        # 第一步：先尝试文字层直接提取（快速路径）
+        if text and len(text) > 5:
+            # 先尝试按货代标签提取（文字层可能有 "序号: X/Y"）
+            fwd_info = extract_forwarder_info(text, page_num, file_path)
+            if fwd_info.get('seq_num') is not None:
+                results.append(fwd_info)
+                continue
+            # 再尝试按 FBA 标签提取
             info, success = extract_page_info(page, page_num, file_path)
             if success:
                 results.append(info)
+                continue
+
+        # 第二步：文字层提取失败，用 OCR 扫描（慢速路径）
+        try:
+            ocr_text = ocr_page(page)
+            # 先尝试按货代标签提取序号
+            info = extract_forwarder_info(ocr_text, page_num, file_path)
+            if info.get('seq_num') is not None:
+                results.append(info)
             else:
-                exceptions.append(info)
+                # 货代提取也失败，尝试按 FBA 标签提取
+                fba_info, fba_success = extract_page_info(page, page_num, file_path)
+                if fba_success:
+                    results.append(fba_info)
+                else:
+                    info['error'] = '序号提取失败'
+                    exceptions.append(info)
+        except Exception as e:
+            exceptions.append({
+                'page_num': page_num,
+                'error': f'OCR失败: {e}',
+                'source_file': file_path,
+            })
 
     doc.close()
     return results, exceptions

@@ -10,27 +10,29 @@ from processor import group_and_sort, match_forwarder_to_amazon, process_and_out
 
 
 class RemarksDialog:
-    """中文备注编辑弹窗"""
+    """中文备注编辑弹窗（含目的地仓库输入）"""
 
-    def __init__(self, parent, sku_counts, existing_remarks=None):
+    def __init__(self, parent, sku_counts, existing_remarks=None, existing_dest=None, has_unmatched_fwd=False):
         self.result = None
+        self.dest_result = None
         self.remarks = dict(existing_remarks) if existing_remarks else {}
         self.entries = {}
         self.sku_counts = sku_counts  # {sku: page_count}
+        self.has_unmatched_fwd = has_unmatched_fwd
 
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("编辑中文备注")
-        self.dialog.geometry("520x460")
+        self.dialog.geometry("520x520")
         self.dialog.transient(parent)
         self.dialog.grab_set()
 
-        self._build_ui(list(sku_counts.keys()))
+        self._build_ui(list(sku_counts.keys()), existing_dest)
         self.dialog.update_idletasks()
         x = parent.winfo_rootx() + (parent.winfo_width() - 520) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - 460) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - 520) // 2
         self.dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
 
-    def _build_ui(self, skus):
+    def _build_ui(self, skus, existing_dest):
         header = ttk.Frame(self.dialog, padding=10)
         header.pack(fill=tk.X)
         ttk.Label(header, text="为每个 SKU 输入中文备注（留空则使用原 SKU）：",
@@ -53,7 +55,7 @@ class RemarksDialog:
 
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
 
         for i, sku in enumerate(sorted(skus)):
             row = ttk.Frame(scrollable)
@@ -68,6 +70,25 @@ class RemarksDialog:
                 entry.insert(0, self.remarks[sku])
             self.entries[sku] = entry
 
+        # 目的地仓库输入（仅当有未匹配的货代标签时显示）
+        self.dest_entry = None
+        if self.has_unmatched_fwd:
+            dest_frame = ttk.LabelFrame(self.dialog, text="货代标签目的地仓库（未匹配时填写）", padding=10)
+            dest_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
+
+            hint = ttk.Label(dest_frame,
+                text="如果货代标签未匹配到 FBA 标签，请在此输入仓库代码（如 TEB9、LAX9）：",
+                font=("", 9), foreground="#666666")
+            hint.pack(anchor=tk.W, pady=(0, 5))
+
+            dest_row = ttk.Frame(dest_frame)
+            dest_row.pack(fill=tk.X)
+            ttk.Label(dest_row, text="目的地仓库：", font=("", 10)).pack(side=tk.LEFT)
+            self.dest_entry = ttk.Entry(dest_row, width=20)
+            self.dest_entry.pack(side=tk.LEFT, padx=(5, 0))
+            if existing_dest:
+                self.dest_entry.insert(0, existing_dest)
+
         btn_frame = ttk.Frame(self.dialog, padding=10)
         btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="确定", command=self._on_ok, width=10).pack(side=tk.RIGHT, padx=5)
@@ -79,6 +100,8 @@ class RemarksDialog:
             val = entry.get().strip()
             if val:
                 self.result[sku] = val
+        if self.dest_entry:
+            self.dest_result = self.dest_entry.get().strip().upper() or None
         self.dialog.destroy()
 
 
@@ -178,6 +201,22 @@ class App:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # 占位提示文字（无数据时显示）
+        placeholder_text = (
+            "1. 填写中文备注\n"
+            "请为每个SKU录入对应的中文备注。\n该备注将直接显示在标签上，作为给工厂的识别信息。\n\n"
+            "2. 自动分组与排序\n"
+            "系统将根据SKU进行分类、分组并生成顺序，\n确保与货袋标签精准对应。\n\n"
+            "注意事项：\n"
+            "请务必遵守「一箱一SKU」原则，\n每个箱子只能装有一个SKU。"
+        )
+        self.placeholder = tk.Label(
+            right, text=placeholder_text,
+            font=("", 10), fg="#AAAAAA", bg="#FFFFFF",
+            justify=tk.LEFT, anchor=tk.CENTER
+        )
+        self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
         # 底部状态栏
         bottom = ttk.Frame(self.root, padding=(10, 5))
         bottom.pack(fill=tk.X)
@@ -224,8 +263,8 @@ class App:
         self.extracted_data = []
         self.exceptions = []
 
-        # 先统计总页数
         import fitz
+        total_files = len(self.pdf_files)
         total_pages = 0
         for fpath in self.pdf_files:
             try:
@@ -238,21 +277,25 @@ class App:
         self.root.after(0, lambda: setattr(self.progress, 'maximum', max(total_pages, 1)))
         self.root.after(0, lambda: setattr(self.progress, 'value', 0))
 
-        processed_pages = 0
+        done_pages = 0
         for i, fpath in enumerate(self.pdf_files):
             fname = os.path.basename(fpath)
-            self._set_status(f"正在处理 ({i + 1}/{len(self.pdf_files)})：{fname}")
+            self.status_var.set(f"正在扫描 ({i + 1}/{total_files})：{fname}")
             self.log_window.log(f"处理：{fname}")
 
             try:
-                results, excs = process_pdf(fpath)
+                def _page_done(cur, tot, _fname=fname, _idx=i+1):
+                    nonlocal done_pages
+                    done_pages += 1
+                    self.progress['value'] = done_pages
+                    self.status_var.set(f"正在扫描 ({_idx}/{total_files})：{_fname} — 第 {cur}/{tot} 页")
+
+                results, excs = process_pdf(fpath, page_callback=_page_done)
                 self.extracted_data.extend(results)
                 self.exceptions.extend(excs)
 
                 ok = len(results)
                 fail = len(excs)
-                processed_pages += ok + fail
-                self.root.after(0, lambda v=processed_pages: setattr(self.progress, 'value', v))
                 self.log_window.log(f"  成功提取 {ok} 页，异常 {fail} 页")
             except Exception as e:
                 self.log_window.log(f"  错误：{e}")
@@ -294,6 +337,7 @@ class App:
         """刷新结果表格 - 按类型和 SKU 去重合并展示"""
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self.placeholder.place_forget()
 
         # FBA 标签汇总
         fba_info = {}
@@ -372,17 +416,48 @@ class App:
             messagebox.showinfo("提示", "未识别到任何 SKU，请检查 PDF 文件。")
             return
 
-        dialog = RemarksDialog(self.root, sku_counts, self.remarks)
+        # 检查是否有未匹配的货代标签
+        has_forwarder = any(p.get('label_type') == 'forwarder' for p in self.extracted_data)
+        matched_fwd, unmatched_fwd = match_forwarder_to_amazon(self.extracted_data, self.remarks)
+        has_unmatched = len(unmatched_fwd) > 0
+
+        # 获取已有的目的地（从未匹配的货代标签中提取）
+        existing_dest = None
+        if unmatched_fwd:
+            dests = set(p.get('destination', '') for p in unmatched_fwd if p.get('destination'))
+            if len(dests) == 1:
+                existing_dest = dests.pop()
+
+        dialog = RemarksDialog(self.root, sku_counts, self.remarks, existing_dest, has_unmatched)
         self.root.wait_window(dialog.dialog)
 
         if dialog.result is not None:
             self.remarks = dialog.result
+
+            # 如果用户输入了目的地，更新未匹配的货代标签
+            if dialog.dest_result and has_unmatched:
+                self._apply_dest_to_unmatched(unmatched_fwd, dialog.dest_result)
+
             # 重新匹配货代标签以更新备注
-            has_forwarder = any(p.get('label_type') == 'forwarder' for p in self.extracted_data)
             if has_forwarder:
                 match_forwarder_to_amazon(self.extracted_data, self.remarks)
             self._refresh_tree()
             self.log_window.log(f"已更新 {len(self.remarks)} 个 SKU 的中文备注")
+
+    def _apply_dest_to_unmatched(self, unmatched_fwd, dest):
+        """将用户输入的目的地应用到未匹配的货代标签"""
+        # 验证格式：3-4个字母 + 1-2个数字（如 TEB9, LAX9, SBD1）
+        import re
+        if not re.match(r'^[A-Za-z]{3,4}\d{1,2}$', dest):
+            messagebox.showwarning("格式错误",
+                f"目的地仓库代码格式不正确：{dest}\n正确格式：3-4个字母 + 1-2个数字（如 TEB9、LAX9）")
+            return
+
+        dest = dest.upper()
+        for fwd in unmatched_fwd:
+            if not fwd.get('destination'):
+                fwd['destination'] = dest
+                self.log_window.log(f"  已为货代标签（第{fwd['page_num']+1}页）设置目的地：{dest}")
 
     def _process_output(self):
         if not self.extracted_data:
@@ -451,6 +526,7 @@ class App:
         self.file_listbox.delete(0, tk.END)
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self.placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
         self.progress['value'] = 0
         self._set_status("已重置 — 请导入亚马逊外箱标签 PDF 文件")
