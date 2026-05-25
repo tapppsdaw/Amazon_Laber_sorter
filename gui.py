@@ -116,6 +116,7 @@ class RemarksDialog:
                 self.result[sku] = val
         if self.dest_entry:
             self.dest_result = self.dest_entry.get().strip().upper() or None
+        self.dialog.destroy()
 
     def _check_length(self, sku):
         entry = self.entries[sku]
