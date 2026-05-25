@@ -516,19 +516,27 @@ class App:
         threading.Thread(target=do_process, daemon=True).start()
 
     def _on_process_done(self, n_pages, n_exc):
-        skus = set(p['sku'] for p in self.extracted_data if p.get('sku'))
+        from processor import match_forwarder_to_amazon
         grouped = group_and_sort(self.extracted_data, self.remarks)
+        # 统计货代标签分组数
+        matched_fwd, _ = match_forwarder_to_amazon(self.extracted_data, self.remarks)
+        fwd_skus = set()
+        for fwd in matched_fwd:
+            fba = fwd.get('matched_fba', {})
+            if fba.get('sku'):
+                fwd_skus.add(fba['sku'])
+        total_files = len(grouped) + len(fwd_skus)
 
         self._set_status(
-            f"输出完成：生成 {len(grouped)} 个 SKU PDF"
+            f"输出完成：生成 {total_files} 个 PDF 文件"
             + (f"，{n_exc} 页异常文件" if n_exc else "")
         )
         self.log_window.log(
-            f"输出完成：{len(grouped)} 个分组文件"
+            f"输出完成：{total_files} 个分组文件"
             + (f"，{n_exc} 页异常" if n_exc else "")
         )
 
-        msg = f"导出成功\n\n已生成 {len(grouped)} 个分组 PDF 文件到：\n{self.output_dir}"
+        msg = f"导出成功\n\n已生成 {total_files} 个 PDF 文件到：\n{self.output_dir}"
         if n_exc:
             msg += f"\n\n另有 {n_exc} 页异常页面归入「异常_需人工核对.pdf」"
         messagebox.showinfo("导出成功", msg)
