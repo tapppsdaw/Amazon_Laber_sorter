@@ -146,7 +146,7 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
         fwd_by_sku = {}
         for fwd in matched_fwd:
             fba = fwd.get('matched_fba', {})
-            sku = (fba.get('sku') or 'unknown').upper()
+            sku = fba.get('sku') or 'unknown'
             fwd_by_sku.setdefault(sku, []).append(fwd)
 
         # 按 FBA 标签的排序顺序排列
