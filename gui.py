@@ -125,7 +125,6 @@ class RemarksDialog:
             warn.config(text="只能输入10个文字")
         else:
             warn.config(text="")
-        self.dialog.destroy()
 
 
 class LogWindow:
