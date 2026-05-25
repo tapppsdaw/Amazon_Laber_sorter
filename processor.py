@@ -140,56 +140,60 @@ def process_and_output(pages, exceptions, remarks, output_dir, progress_callback
             print(f"  已生成：{output_path}（{len(out_doc)} 页）")
         out_doc.close()
 
-    # 输出货代标签（按匹配到的 FBA 排序顺序）
+    # 输出货代标签（按 SKU 分组，每个 SKU 一个文件）
     if matched_fwd:
+        # 按 SKU 分组
+        fwd_by_sku = {}
+        for fwd in matched_fwd:
+            fba = fwd.get('matched_fba', {})
+            sku = (fba.get('sku') or 'unknown').upper()
+            fwd_by_sku.setdefault(sku, []).append(fwd)
+
         # 按 FBA 标签的排序顺序排列
         fba_order = {}
         for i, p in enumerate(fba_pages):
             key = ((p.get('destination') or '').upper(), p.get('box_current'))
             fba_order[key] = i
 
-        def _fwd_sort_key(fwd):
-            dest = (fwd.get('destination') or '').upper()
-            seq = fwd.get('seq_num', 999)
-            return fba_order.get((dest, seq), 999)
+        for sku, sku_fwds in fwd_by_sku.items():
+            def _fwd_sort_key(fwd):
+                dest = (fwd.get('destination') or '').upper()
+                seq = fwd.get('seq_num', 999)
+                return fba_order.get((dest, seq), 999)
 
-        matched_fwd.sort(key=_fwd_sort_key)
+            sku_fwds.sort(key=_fwd_sort_key)
 
-        fwd_doc = fitz.open()
-        # 按 FBA SKU 分组编号（和 FBA 输出保持一致）
-        sku_fwd_counter = {}
-        for fwd in matched_fwd:
-            src_path = fwd['source_file']
-            page_num = fwd['page_num']
-            try:
-                src_doc = _get_doc(src_path)
-                if page_num < len(src_doc):
-                    fwd_doc.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
-                    new_page = fwd_doc[-1]
-                    remark = fwd.get('remark', '')
-                    dest = fwd.get('destination', '')
-                    # 使用匹配到的 FBA 的排序序号（和 FBA 输出的第N箱一致）
-                    fba = fwd.get('matched_fba', {})
-                    fba_sku = (fba.get('sku') or '').upper()
-                    sku_fwd_counter[fba_sku] = sku_fwd_counter.get(fba_sku, 0) + 1
-                    box_num = sku_fwd_counter[fba_sku]
-                    label_text = remark or ''
-                    label_text += f" 第{box_num}件"
-                    if dest:
-                        label_text += f" [{dest}]"
+            label = remarks.get(sku, sku)
+            safe_label = _sanitize_filename(label)
+            fwd_path = os.path.join(output_dir, f"{safe_label}_货代标签.pdf")
+
+            fwd_doc = fitz.open()
+            for box_num, fwd in enumerate(sku_fwds, start=1):
+                src_path = fwd['source_file']
+                page_num = fwd['page_num']
+                try:
+                    src_doc = _get_doc(src_path)
+                    if page_num < len(src_doc):
+                        fwd_doc.insert_pdf(src_doc, from_page=page_num, to_page=page_num)
+                        new_page = fwd_doc[-1]
+                        remark = fwd.get('remark', '')
+                        dest = fwd.get('destination', '')
+                        label_text = remark or ''
+                        label_text += f" 第{box_num}件"
+                        if dest:
+                            label_text += f" [{dest}]"
                         if label_text:
                             _add_label_to_page(new_page, label_text, None, None)
-            except Exception as e:
-                print(f"  警告：货代页面处理出错 - {e}")
-            total_pages += 1
-            if progress_callback:
-                progress_callback(total_pages)
+                except Exception as e:
+                    print(f"  警告：货代页面处理出错 - {e}")
+                total_pages += 1
+                if progress_callback:
+                    progress_callback(total_pages)
 
-        if len(fwd_doc) > 0:
-            fwd_path = os.path.join(output_dir, "货代标签_整理版.pdf")
-            fwd_doc.save(fwd_path)
-            print(f"  已生成货代文件：{fwd_path}（{len(fwd_doc)} 页）")
-        fwd_doc.close()
+            if len(fwd_doc) > 0:
+                fwd_doc.save(fwd_path)
+                print(f"  已生成货代文件：{fwd_path}（{len(fwd_doc)} 页）")
+            fwd_doc.close()
 
     # 处理异常页面（包括未匹配的货代标签）
     all_exceptions = list(exceptions) + list(unmatched_fwd)
