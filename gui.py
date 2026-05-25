@@ -57,6 +57,8 @@ class RemarksDialog:
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind("<MouseWheel>", _on_mousewheel)
 
+        self.warn_labels = {}
+
         for i, sku in enumerate(sorted(skus)):
             row = ttk.Frame(scrollable)
             row.pack(fill=tk.X, pady=3)
@@ -69,6 +71,12 @@ class RemarksDialog:
             if sku in self.remarks:
                 entry.insert(0, self.remarks[sku])
             self.entries[sku] = entry
+
+            warn = tk.Label(row, text="", fg="red", font=("", 8))
+            warn.pack(side=tk.LEFT, padx=(5, 0))
+            self.warn_labels[sku] = warn
+
+            entry.bind("<KeyRelease>", lambda e, s=sku: self._check_length(s))
 
         # 目的地仓库输入（仅当有未匹配的货代标签时显示）
         self.dest_entry = None
@@ -95,6 +103,12 @@ class RemarksDialog:
         ttk.Button(btn_frame, text="取消", command=self.dialog.destroy, width=10).pack(side=tk.RIGHT)
 
     def _on_ok(self):
+        # 检查是否有超长输入
+        for sku, entry in self.entries.items():
+            val = entry.get().strip()
+            if len(val) > 10:
+                self.warn_labels[sku].config(text="只能输入10个文字")
+                return
         self.result = {}
         for sku, entry in self.entries.items():
             val = entry.get().strip()
@@ -102,6 +116,15 @@ class RemarksDialog:
                 self.result[sku] = val
         if self.dest_entry:
             self.dest_result = self.dest_entry.get().strip().upper() or None
+
+    def _check_length(self, sku):
+        entry = self.entries[sku]
+        warn = self.warn_labels[sku]
+        val = entry.get()
+        if len(val) > 10:
+            warn.config(text="只能输入10个文字")
+        else:
+            warn.config(text="")
         self.dialog.destroy()
 
 
