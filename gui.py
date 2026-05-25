@@ -536,10 +536,7 @@ class App:
             + (f"，{n_exc} 页异常" if n_exc else "")
         )
 
-        msg = f"导出成功\n\n已生成 {total_files} 个 PDF 文件到：\n{self.output_dir}"
-        if n_exc:
-            msg += f"\n\n另有 {n_exc} 页异常页面归入「异常_需人工核对.pdf」"
-        messagebox.showinfo("导出成功", msg)
+        messagebox.showinfo("导出成功", "导出成功")
 
     def _show_log(self):
         self.log_window.show()
