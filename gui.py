@@ -208,7 +208,7 @@ class App:
             "2. 自动分组与排序\n"
             "系统将根据SKU进行分类、分组并生成顺序，\n确保与货袋标签精准对应。\n\n"
             "注意事项：\n"
-            "请务必遵守「一箱一SKU」原则，\n每个箱子只能装有一个SKU。"
+            "请务必遵守「一箱一SKU」原则，\n每个箱子只能装有一个SKU。\n只支持10*10 PDF（一页一码）。"
         )
         self.placeholder = tk.Label(
             right, text=placeholder_text,
